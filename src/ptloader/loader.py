@@ -72,17 +72,15 @@ class _TorchCheckpointUnpickler(pickle.Unpickler):
     def find_class(self, module: str, name: str) -> Any:
         if module == "torch" and name.endswith("Storage"):
             return name
-
-        allowed = {
-            ("collections", "OrderedDict"): OrderedDict,
-            ("torch._utils", "_rebuild_tensor"): _rebuild_tensor,
-            ("torch._utils", "_rebuild_tensor_v2"): _rebuild_tensor_v2,
-            ("torch._utils", "_rebuild_parameter"): _rebuild_parameter,
-        }
-        try:
-            return allowed[(module, name)]
-        except KeyError as exc:
-            raise CheckpointError(f"Unsupported pickle global: {module}.{name}") from exc
+        if module == "collections" and name == "OrderedDict":
+            return OrderedDict
+        if module == "torch._utils" and name == "_rebuild_tensor":
+            return _rebuild_tensor
+        if module == "torch._utils" and name == "_rebuild_tensor_v2":
+            return _rebuild_tensor_v2
+        if module == "torch._utils" and name == "_rebuild_parameter":
+            return _rebuild_parameter
+        raise CheckpointError(f"Unsupported pickle global: {module}.{name}")
 
     def persistent_load(self, pid: Any) -> np.ndarray[Any, Any]:
         if not isinstance(pid, tuple) or len(pid) < 5 or pid[0] != "storage":
@@ -159,18 +157,14 @@ def _archive_root(archive: zipfile.ZipFile) -> str:
 
 def _load_from_archive(archive: zipfile.ZipFile) -> Any:
     root = _archive_root(archive)
-    names = set(archive.namelist())
-
-    byteorder = "little"
     byteorder_name = f"{root}/byteorder"
-    if byteorder_name in names:
-        byteorder = archive.read(byteorder_name).decode("utf-8").strip()
+    byteorder = (
+        archive.read(byteorder_name).decode("utf-8").strip()
+        if byteorder_name in archive.namelist()
+        else "little"
+    )
 
-    data_name = f"{root}/data.pkl"
-    if data_name not in names:
-        raise CheckpointError("Could not locate data.pkl in checkpoint archive")
-
-    payload = archive.read(data_name)
+    payload = archive.read(f"{root}/data.pkl")
     obj = _TorchCheckpointUnpickler(payload, archive, root, byteorder).load()
     return _convert_tensors(obj)
 
@@ -195,16 +189,9 @@ def load(
     if weights_only is False:
         raise CheckpointError("ptloader.load only supports weights_only=True behavior")
 
-    if hasattr(f, "read") and hasattr(f, "seek"):
-        stream = f
-        if not zipfile.is_zipfile(stream):
-            raise ValueError("Only zip-based torch checkpoints are supported")
-        with zipfile.ZipFile(stream, mode="r") as archive:
-            return _load_from_archive(archive)
-
-    checkpoint_path = Path(f)
-    if not zipfile.is_zipfile(checkpoint_path):
+    source: BinaryIO | Path
+    source = f if hasattr(f, "read") and hasattr(f, "seek") else Path(f)
+    if not zipfile.is_zipfile(source):
         raise ValueError("Only zip-based torch checkpoints are supported")
-
-    with zipfile.ZipFile(checkpoint_path, mode="r") as archive:
+    with zipfile.ZipFile(source, mode="r") as archive:
         return _load_from_archive(archive)
