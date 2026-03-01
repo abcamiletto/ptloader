@@ -102,6 +102,32 @@ def test_rejects_legacy_non_zip_checkpoints(tmp_path: Path) -> None:
         load(checkpoint)
 
 
+def test_accepts_file_object(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "fileobj.pt"
+    _save_checkpoint(checkpoint, {"x": torch.tensor([1, 2, 3], dtype=torch.int64)})
+
+    with checkpoint.open("rb") as f:
+        loaded = load(f)
+
+    np.testing.assert_array_equal(loaded["x"], np.array([1, 2, 3], dtype=np.int64))
+
+
+def test_rejects_map_location(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "map_location.pt"
+    _save_checkpoint(checkpoint, {"x": torch.tensor([4, 5], dtype=torch.int64)})
+
+    with pytest.raises(CheckpointError, match="map_location"):
+        load(checkpoint, map_location="cpu")
+
+
+def test_rejects_weights_only_false(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "weights_only.pt"
+    _save_checkpoint(checkpoint, {"x": torch.tensor([1], dtype=torch.int64)})
+
+    with pytest.raises(CheckpointError, match="weights_only"):
+        load(checkpoint, weights_only=False)
+
+
 def test_load_scalar_tensor(tmp_path: Path) -> None:
     checkpoint = tmp_path / "scalar.pt"
     _save_checkpoint(checkpoint, {"value": torch.tensor(7.5, dtype=torch.float32)})

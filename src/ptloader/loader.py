@@ -5,7 +5,7 @@ from io import BytesIO
 from pathlib import Path
 import pickle
 import zipfile
-from typing import Any
+from typing import Any, BinaryIO
 
 import numpy as np
 
@@ -157,26 +157,54 @@ def _archive_root(archive: zipfile.ZipFile) -> str:
     raise CheckpointError("Could not locate data.pkl in checkpoint archive")
 
 
-def load(path: str | Path) -> Any:
-    """Load a torch zip checkpoint into Python objects with NumPy tensors."""
+def _load_from_archive(archive: zipfile.ZipFile) -> Any:
+    root = _archive_root(archive)
+    names = set(archive.namelist())
 
-    checkpoint_path = Path(path)
+    byteorder = "little"
+    byteorder_name = f"{root}/byteorder"
+    if byteorder_name in names:
+        byteorder = archive.read(byteorder_name).decode("utf-8").strip()
+
+    data_name = f"{root}/data.pkl"
+    if data_name not in names:
+        raise CheckpointError("Could not locate data.pkl in checkpoint archive")
+
+    payload = archive.read(data_name)
+    obj = _TorchCheckpointUnpickler(payload, archive, root, byteorder).load()
+    return _convert_tensors(obj)
+
+
+def load(
+    f: str | Path | BinaryIO,
+    map_location: Any | None = None,
+    pickle_module: Any | None = None,
+    *,
+    weights_only: bool | None = None,
+    mmap: Any | None = None,
+    **pickle_load_args: Any,
+) -> Any:
+    """Load a torch checkpoint and return objects where tensors are NumPy arrays."""
+
+    if map_location is not None:
+        raise CheckpointError("map_location is not supported by ptloader.load")
+    if pickle_module is not None or mmap is not None or pickle_load_args:
+        raise CheckpointError(
+            "pickle_module, mmap, and custom pickle args are not supported by ptloader.load"
+        )
+    if weights_only is False:
+        raise CheckpointError("ptloader.load only supports weights_only=True behavior")
+
+    if hasattr(f, "read") and hasattr(f, "seek"):
+        stream = f
+        if not zipfile.is_zipfile(stream):
+            raise ValueError("Only zip-based torch checkpoints are supported")
+        with zipfile.ZipFile(stream, mode="r") as archive:
+            return _load_from_archive(archive)
+
+    checkpoint_path = Path(f)
     if not zipfile.is_zipfile(checkpoint_path):
         raise ValueError("Only zip-based torch checkpoints are supported")
 
     with zipfile.ZipFile(checkpoint_path, mode="r") as archive:
-        root = _archive_root(archive)
-        names = set(archive.namelist())
-
-        byteorder = "little"
-        byteorder_name = f"{root}/byteorder"
-        if byteorder_name in names:
-            byteorder = archive.read(byteorder_name).decode("utf-8").strip()
-
-        data_name = f"{root}/data.pkl"
-        if data_name not in names:
-            raise CheckpointError("Could not locate data.pkl in checkpoint archive")
-
-        payload = archive.read(data_name)
-        obj = _TorchCheckpointUnpickler(payload, archive, root, byteorder).load()
-        return _convert_tensors(obj)
+        return _load_from_archive(archive)
