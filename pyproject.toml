@@ -1,6 +1,6 @@
 [project]
 name = "ptloader"
-version = "0.1.4"
+version = "0.1.5"
 description = "Load torch checkpoints as NumPy arrays without torch at runtime."
 readme = "README.md"
 authors = [
