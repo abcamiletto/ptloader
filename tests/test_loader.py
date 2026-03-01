@@ -382,6 +382,38 @@ def test_load_torchscript_public_api(tmp_path: Path) -> None:
     np.testing.assert_array_equal(loaded["x"], values)
 
 
+def test_torchscript_prefers_data_payload_and_can_override_to_constants(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "torchscript_both_payloads.pt"
+    data_values = np.array([100.0, 101.0], dtype=np.float32)
+    constants_values = np.array([200.0, 201.0], dtype=np.float32)
+
+    data_payload = {
+        "x": _TensorPayload(
+            _StorageRef("FloatStorage", "1", data_values.size),
+            shape=(data_values.size,),
+        )
+    }
+    constants_payload = {
+        "x": _TensorPayload(
+            _StorageRef("FloatStorage", "0", constants_values.size),
+            shape=(constants_values.size,),
+        )
+    }
+
+    with zipfile.ZipFile(checkpoint, "w") as archive:
+        archive.writestr("data.pkl", _dumps_payload(data_payload))
+        archive.writestr("constants.pkl", _dumps_payload(constants_payload))
+        archive.writestr("byteorder", "little")
+        archive.writestr("data/0", constants_values.tobytes())
+        archive.writestr("data/1", data_values.tobytes())
+
+    auto_loaded = load_torchscript(checkpoint)
+    np.testing.assert_array_equal(auto_loaded["x"], data_values)
+
+    constants_loaded = load_torchscript(checkpoint, payload="constants")
+    np.testing.assert_array_equal(constants_loaded["x"], constants_values)
+
+
 def test_unknown_storage_callback_can_decode_custom_storage(tmp_path: Path) -> None:
     checkpoint = tmp_path / "unknown_storage_callback.pt"
     values = np.array([1.5, 2.5], dtype=np.float32)

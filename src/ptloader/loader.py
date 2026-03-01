@@ -284,21 +284,31 @@ def _convert_tensors(obj: Any, convert_attributes: bool = False, *, _seen: set[i
     return obj
 
 
-def _find_archive_payload(archive: zipfile.ZipFile) -> tuple[str, str]:
+def _find_archive_payload(archive: zipfile.ZipFile, *, payload: str, prefer_data: bool) -> tuple[str, str]:
+    if payload not in ("auto", "data", "constants"):
+        raise CheckpointError("payload must be one of: 'auto', 'data', 'constants'")
+
     names = set(archive.namelist())
-    if "constants.pkl" in names:
-        return "", "constants.pkl"
-    if "data.pkl" in names:
-        return "", "data.pkl"
+    if payload == "auto":
+        payload_order = ("data.pkl", "constants.pkl") if prefer_data else ("constants.pkl", "data.pkl")
+    else:
+        payload_order = (f"{payload}.pkl",)
 
-    for name in names:
-        if name.endswith("/constants.pkl"):
-            return name[: -len("/constants.pkl")], "constants.pkl"
-    for name in names:
-        if name.endswith("/data.pkl"):
-            return name[: -len("/data.pkl")], "data.pkl"
+    for payload_name in payload_order:
+        if payload_name in names:
+            return "", payload_name
 
-    raise CheckpointError("Could not locate checkpoint payload (data.pkl or constants.pkl)")
+    for payload_name in payload_order:
+        suffix = f"/{payload_name}"
+        for name in names:
+            if name.endswith(suffix):
+                return name[: -len(suffix)], payload_name
+
+    raise CheckpointError(
+        f"Could not locate checkpoint payload ({payload}.pkl)"
+        if payload in ("data", "constants")
+        else "Could not locate checkpoint payload (data.pkl or constants.pkl)"
+    )
 
 
 def _archive_byteorder(archive: zipfile.ZipFile, root: str) -> str:
@@ -313,12 +323,17 @@ def _load_from_archive(
     archive: zipfile.ZipFile,
     *,
     torchscript_mode: str | None,
+    payload: str = "auto",
     storage_registry: Mapping[str, np.dtype[Any]] | None = None,
     pickle_global_registry: Mapping[tuple[str, str], Any] | None = None,
     storage_type_resolver: StorageResolver | None = None,
     pickle_global_resolver: GlobalResolver | None = None,
 ) -> Any:
-    root, payload_name = _find_archive_payload(archive)
+    root, payload_name = _find_archive_payload(
+        archive,
+        payload=payload,
+        prefer_data=torchscript_mode == "permissive",
+    )
     payload_path = payload_name if root == "" else f"{root}/{payload_name}"
     byteorder = _archive_byteorder(archive, root)
 
@@ -360,6 +375,7 @@ def load(
     weights_only: bool | None = None,
     mmap: Any | None = None,
     torchscript_mode: str | None = None,
+    payload: str = "auto",
     return_script_object: bool = False,
     storage_registry: Mapping[str, np.dtype[Any]] | None = None,
     pickle_global_registry: Mapping[tuple[str, str], Any] | None = None,
@@ -379,6 +395,8 @@ def load(
         raise CheckpointError("ptloader.load only supports weights_only=True behavior")
     if torchscript_mode not in (None, "permissive"):
         raise CheckpointError("torchscript_mode must be one of: None, 'permissive'")
+    if payload not in ("auto", "data", "constants"):
+        raise CheckpointError("payload must be one of: 'auto', 'data', 'constants'")
 
     if return_script_object and torchscript_mode is None:
         torchscript_mode = "permissive"
@@ -391,6 +409,7 @@ def load(
         return _load_from_archive(
             archive,
             torchscript_mode=torchscript_mode,
+            payload=payload,
             storage_registry=storage_registry,
             pickle_global_registry=pickle_global_registry,
             storage_type_resolver=storage_type_resolver,
@@ -407,5 +426,6 @@ def load_torchscript(
     """Load a TorchScript archive and return reconstructed script objects."""
 
     kwargs["torchscript_mode"] = "permissive"
+    kwargs.setdefault("payload", "auto")
     kwargs["return_script_object"] = return_script_object
     return load(f, **kwargs)
