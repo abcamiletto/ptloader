@@ -23,7 +23,10 @@ jobs:
         uses: astral-sh/setup-uv@v6
 
       - name: Install dependencies
-        run: uv sync --frozen --all-groups
+        run: |
+          uv sync --frozen --no-dev
+          uv pip install --python .venv/bin/python --index-url https://download.pytorch.org/whl/cpu torch
+          uv pip install --python .venv/bin/python pytest
 
       - name: Run tests
-        run: uv run pytest -q
+        run: uv run --no-sync pytest -q
