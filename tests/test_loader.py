@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 import torch
 
-from ptloader import load, load_torchscript
+from ptloader import load
 from ptloader.loader import CheckpointError
 
 
@@ -93,17 +93,22 @@ def _write_synthetic_archive(
             archive.writestr(f"{data_prefix}/{key}", blob)
 
 
-def _make_torchscript_module_like(payload: Any) -> Any:
-    module = sys.modules.get("__torch__")
+def _make_torchscript_module_like(
+    payload: Any,
+    *,
+    module_name: str = "__torch__",
+    class_name: str = "ModuleLike",
+) -> Any:
+    module = sys.modules.get(module_name)
     if module is None:
-        module = types.ModuleType("__torch__")
-        sys.modules["__torch__"] = module
+        module = types.ModuleType(module_name)
+        sys.modules[module_name] = module
 
-    cls = getattr(module, "ModuleLike", None)
+    cls = getattr(module, class_name, None)
     if cls is None:
-        cls = type("ModuleLike", (), {})
-        cls.__module__ = "__torch__"
-        module.ModuleLike = cls
+        cls = type(class_name, (), {})
+        cls.__module__ = module_name
+        setattr(module, class_name, cls)
 
     obj = cls()
     obj.tensor = payload
@@ -355,9 +360,9 @@ def test_torchscript_permissive_converts_object_attributes(tmp_path: Path) -> No
     )
 
     with pytest.raises(CheckpointError, match="Unsupported pickle global: __torch__"):
-        load(checkpoint)
+        load(checkpoint, torchscript_mode="strict")
 
-    loaded = load(checkpoint, torchscript_mode="permissive", return_script_object=True)
+    loaded = load(checkpoint)
 
     assert isinstance(loaded.tensor, np.ndarray)
     np.testing.assert_array_equal(loaded.tensor, values)
@@ -365,8 +370,56 @@ def test_torchscript_permissive_converts_object_attributes(tmp_path: Path) -> No
     np.testing.assert_array_equal(loaded.inner["tensor"], values)
 
 
-def test_load_torchscript_public_api(tmp_path: Path) -> None:
-    checkpoint = tmp_path / "load_torchscript_api.pt"
+def test_torchscript_permissive_allows_nested___torch___module_globals(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "torchscript_nested_module.pt"
+    values = np.array([13.0, 14.0], dtype=np.float32)
+    tensor_payload = _float_storage_payload(values)
+    payload = _make_torchscript_module_like(
+        tensor_payload,
+        module_name="__torch__.pymomentum.torch.character",
+        class_name="BlendShapeBase",
+    )
+    _write_synthetic_archive(
+        checkpoint,
+        payload,
+        {"0": values.tobytes()},
+        payload_name="constants.pkl",
+        root="",
+    )
+
+    loaded = load(checkpoint, torchscript_mode="permissive")
+
+    assert isinstance(loaded.tensor, np.ndarray)
+    np.testing.assert_array_equal(loaded.tensor, values)
+    assert isinstance(loaded.inner["tensor"], np.ndarray)
+    np.testing.assert_array_equal(loaded.inner["tensor"], values)
+
+
+def test_load_ultra_permissive_mode(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "torchscript_ultra_permissive.pt"
+    values = np.array([21.0, 22.0], dtype=np.float32)
+    tensor_payload = _float_storage_payload(values)
+    payload = _make_torchscript_module_like(
+        tensor_payload,
+        module_name="__torch__.pymomentum.torch.character",
+        class_name="BlendShapeBase",
+    )
+    _write_synthetic_archive(
+        checkpoint,
+        payload,
+        {"0": values.tobytes()},
+        payload_name="constants.pkl",
+        root="",
+    )
+
+    loaded = load(checkpoint, torchscript_mode="ultra_permissive")
+
+    assert isinstance(loaded.tensor, np.ndarray)
+    np.testing.assert_array_equal(loaded.tensor, values)
+
+
+def test_load_auto_mode_on_torchscript_archive(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "load_auto_mode.pt"
     values = np.array([11.0, 12.0], dtype=np.float32)
     payload = {"x": _float_storage_payload(values)}
     _write_synthetic_archive(
@@ -377,7 +430,7 @@ def test_load_torchscript_public_api(tmp_path: Path) -> None:
         root="",
     )
 
-    loaded = load_torchscript(checkpoint)
+    loaded = load(checkpoint)
 
     np.testing.assert_array_equal(loaded["x"], values)
 
@@ -407,10 +460,10 @@ def test_torchscript_prefers_data_payload_and_can_override_to_constants(tmp_path
         archive.writestr("data/0", constants_values.tobytes())
         archive.writestr("data/1", data_values.tobytes())
 
-    auto_loaded = load_torchscript(checkpoint)
+    auto_loaded = load(checkpoint)
     np.testing.assert_array_equal(auto_loaded["x"], data_values)
 
-    constants_loaded = load_torchscript(checkpoint, payload="constants")
+    constants_loaded = load(checkpoint, payload="constants")
     np.testing.assert_array_equal(constants_loaded["x"], constants_values)
 
 

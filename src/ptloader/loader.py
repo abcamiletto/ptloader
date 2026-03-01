@@ -119,23 +119,24 @@ def _build_intlist(*values: Any) -> list[int]:
 
 
 
-def _get_torchscript_object_type(name: str) -> type[Any]:
-    cached = _torchscript_object_types.get(name)
+def _get_torchscript_object_type(module: str, name: str) -> type[Any]:
+    symbol = f"{module}.{name}"
+    cached = _torchscript_object_types.get(symbol)
     if cached is not None:
         return cached
 
     class _TorchScriptObject(_TorchScriptUnknown):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
-            self.__torch_type__ = name
+            self.__torch_type__ = symbol
             self.args = list(args)
             self.__dict__.update(kwargs)
 
         def __repr__(self) -> str:
-            return f"<{name} {self.__dict__}>"
+            return f"<{symbol} {self.__dict__}>"
 
     _TorchScriptObject.__name__ = name
     cls = _TorchScriptObject
-    _torchscript_object_types[name] = cls
+    _torchscript_object_types[symbol] = cls
     return cls
 
 
@@ -204,10 +205,10 @@ class _TorchCheckpointUnpickler(pickle.Unpickler):
         if module == "torch" and name.endswith("Storage"):
             return name
 
-        if module == "__torch__":
+        if module == "__torch__" or module.startswith("__torch__."):
             if not self._permissive_torchscript:
                 raise CheckpointError(f"Unsupported pickle global: {module}.{name}")
-            return _get_torchscript_object_type(name)
+            return _get_torchscript_object_type(module, name)
 
         if module.startswith("torch.jit._pickle"):
             if not self._permissive_torchscript:
@@ -322,17 +323,27 @@ def _archive_byteorder(archive: zipfile.ZipFile, root: str) -> str:
 def _load_from_archive(
     archive: zipfile.ZipFile,
     *,
-    torchscript_mode: str | None,
+    torchscript_mode: str,
     payload: str = "auto",
     storage_registry: Mapping[str, np.dtype[Any]] | None = None,
     pickle_global_registry: Mapping[tuple[str, str], Any] | None = None,
     storage_type_resolver: StorageResolver | None = None,
     pickle_global_resolver: GlobalResolver | None = None,
 ) -> Any:
+    names = archive.namelist()
+    is_torchscript_archive = any(name == "constants.pkl" or name.endswith("/constants.pkl") for name in names)
+
+    if torchscript_mode == "auto":
+        permissive_torchscript = is_torchscript_archive
+    elif torchscript_mode == "strict":
+        permissive_torchscript = False
+    else:
+        permissive_torchscript = True
+
     root, payload_name = _find_archive_payload(
         archive,
         payload=payload,
-        prefer_data=torchscript_mode == "permissive",
+        prefer_data=permissive_torchscript,
     )
     payload_path = payload_name if root == "" else f"{root}/{payload_name}"
     byteorder = _archive_byteorder(archive, root)
@@ -350,7 +361,6 @@ def _load_from_archive(
     if pickle_global_resolver is None:
         pickle_global_resolver = _UNKNOWN_PICKLE_GLOBAL_HANDLER
 
-    permissive_torchscript = torchscript_mode == "permissive"
     payload = archive.read(payload_path)
     obj = _TorchCheckpointUnpickler(
         payload,
@@ -374,9 +384,8 @@ def load(
     *,
     weights_only: bool | None = None,
     mmap: Any | None = None,
-    torchscript_mode: str | None = None,
+    torchscript_mode: str = "auto",
     payload: str = "auto",
-    return_script_object: bool = False,
     storage_registry: Mapping[str, np.dtype[Any]] | None = None,
     pickle_global_registry: Mapping[tuple[str, str], Any] | None = None,
     storage_type_resolver: StorageResolver | None = None,
@@ -393,13 +402,12 @@ def load(
         )
     if weights_only is False:
         raise CheckpointError("ptloader.load only supports weights_only=True behavior")
-    if torchscript_mode not in (None, "permissive"):
-        raise CheckpointError("torchscript_mode must be one of: None, 'permissive'")
+    if torchscript_mode not in ("auto", "strict", "permissive", "ultra_permissive"):
+        raise CheckpointError(
+            "torchscript_mode must be one of: 'auto', 'strict', 'permissive', 'ultra_permissive'"
+        )
     if payload not in ("auto", "data", "constants"):
         raise CheckpointError("payload must be one of: 'auto', 'data', 'constants'")
-
-    if return_script_object and torchscript_mode is None:
-        torchscript_mode = "permissive"
 
     source: BinaryIO | Path
     source = f if hasattr(f, "read") and hasattr(f, "seek") else Path(f)
@@ -415,17 +423,3 @@ def load(
             storage_type_resolver=storage_type_resolver,
             pickle_global_resolver=pickle_global_resolver,
         )
-
-
-def load_torchscript(
-    f: str | Path | BinaryIO,
-    *,
-    return_script_object: bool = True,
-    **kwargs: Any,
-) -> Any:
-    """Load a TorchScript archive and return reconstructed script objects."""
-
-    kwargs["torchscript_mode"] = "permissive"
-    kwargs.setdefault("payload", "auto")
-    kwargs["return_script_object"] = return_script_object
-    return load(f, **kwargs)
