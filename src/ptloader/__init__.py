@@ -1,3 +1,3 @@
-from .loader import load
+from .loader import CheckpointError, load
 
-__all__ = ["load"]
+__all__ = ["CheckpointError", "load"]
