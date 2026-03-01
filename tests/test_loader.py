@@ -2,20 +2,124 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from fractions import Fraction
+from io import BytesIO
 from pathlib import Path
+import pickle
+import sys
+import types
+from typing import Any
 import zipfile
 
 import numpy as np
 import pytest
 import torch
 
-from ptloader import load
+from ptloader import load, load_torchscript
 from ptloader.loader import CheckpointError
 
 
 def _save_checkpoint(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
+
+
+class _StorageRef:
+    def __init__(self, storage_type: str, key: str, size: int) -> None:
+        self.storage_type = storage_type
+        self.key = key
+        self.size = size
+
+
+def _contiguous_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
+    if not shape:
+        return ()
+    stride = [1] * len(shape)
+    for i in range(len(shape) - 2, -1, -1):
+        stride[i] = stride[i + 1] * shape[i + 1]
+    return tuple(stride)
+
+
+class _TensorPayload:
+    def __init__(
+        self,
+        storage: _StorageRef,
+        shape: tuple[int, ...],
+        stride: tuple[int, ...] | None = None,
+        storage_offset: int = 0,
+    ) -> None:
+        self.storage = storage
+        self.shape = shape
+        self.stride = stride if stride is not None else _contiguous_stride(shape)
+        self.storage_offset = storage_offset
+
+    def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
+        return (
+            torch._utils._rebuild_tensor,
+            (self.storage, self.storage_offset, self.shape, self.stride),
+        )
+
+
+class _PersistentPickler(pickle.Pickler):
+    def persistent_id(self, obj: Any) -> Any:
+        if isinstance(obj, _StorageRef):
+            return ("storage", obj.storage_type, obj.key, "cpu", obj.size)
+        return None
+
+
+def _dumps_payload(payload: Any) -> bytes:
+    buffer = BytesIO()
+    _PersistentPickler(buffer, protocol=4).dump(payload)
+    return buffer.getvalue()
+
+
+def _write_synthetic_archive(
+    path: Path,
+    payload: Any,
+    storage_blobs: dict[str, bytes],
+    *,
+    payload_name: str = "data.pkl",
+    root: str = "archive",
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload_entry = f"{root}/{payload_name}" if root else payload_name
+    byteorder_entry = f"{root}/byteorder" if root else "byteorder"
+    data_prefix = f"{root}/data" if root else "data"
+    payload_blob = _dumps_payload(payload)
+
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(payload_entry, payload_blob)
+        archive.writestr(byteorder_entry, "little")
+        for key, blob in storage_blobs.items():
+            archive.writestr(f"{data_prefix}/{key}", blob)
+
+
+def _make_torchscript_module_like(payload: Any) -> Any:
+    module = sys.modules.get("__torch__")
+    if module is None:
+        module = types.ModuleType("__torch__")
+        sys.modules["__torch__"] = module
+
+    cls = getattr(module, "ModuleLike", None)
+    if cls is None:
+        cls = type("ModuleLike", (), {})
+        cls.__module__ = "__torch__"
+        module.ModuleLike = cls
+
+    obj = cls()
+    obj.tensor = payload
+    obj.inner = {"tensor": payload}
+    return obj
+
+
+def _custom_build_box(value: Any) -> dict[str, Any]:
+    return {"wrapped": value}
+
+
+def _float_storage_payload(values: np.ndarray[Any, Any]) -> _TensorPayload:
+    return _TensorPayload(
+        _StorageRef("FloatStorage", "0", values.size),
+        shape=(values.size,),
+    )
 
 
 def test_load_tensor_as_numpy_array(tmp_path: Path) -> None:
@@ -201,3 +305,127 @@ def test_rejects_missing_data_pickle_entry(tmp_path: Path) -> None:
 
     with pytest.raises(CheckpointError, match="data.pkl"):
         load(checkpoint)
+
+
+def test_supports_uint32_storage_in_synthetic_archive(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "uint32_storage.pt"
+    values = np.array([1, 2, 3, 2**31], dtype=np.uint32)
+    payload = {
+        "x": _TensorPayload(
+            _StorageRef("UInt32Storage", "0", values.size),
+            shape=(values.size,),
+        )
+    }
+    _write_synthetic_archive(checkpoint, payload, {"0": values.tobytes()})
+
+    loaded = load(checkpoint)
+
+    assert loaded["x"].dtype == np.uint32
+    np.testing.assert_array_equal(loaded["x"], values)
+
+
+def test_loads_torchscript_constants_archive(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "torchscript_constants.pt"
+    values = np.array([0.25, 0.5, 0.75], dtype=np.float32)
+    payload = {"const": _float_storage_payload(values)}
+    _write_synthetic_archive(
+        checkpoint,
+        payload,
+        {"0": values.tobytes()},
+        payload_name="constants.pkl",
+        root="",
+    )
+
+    loaded = load(checkpoint)
+
+    np.testing.assert_array_equal(loaded["const"], values)
+
+
+def test_torchscript_permissive_converts_object_attributes(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "torchscript_permissive.pt"
+    values = np.array([7.0, 8.0], dtype=np.float32)
+    tensor_payload = _float_storage_payload(values)
+    payload = _make_torchscript_module_like(tensor_payload)
+    _write_synthetic_archive(
+        checkpoint,
+        payload,
+        {"0": values.tobytes()},
+        payload_name="constants.pkl",
+        root="",
+    )
+
+    with pytest.raises(CheckpointError, match="Unsupported pickle global: __torch__"):
+        load(checkpoint)
+
+    loaded = load(checkpoint, torchscript_mode="permissive", return_script_object=True)
+
+    assert isinstance(loaded.tensor, np.ndarray)
+    np.testing.assert_array_equal(loaded.tensor, values)
+    assert isinstance(loaded.inner["tensor"], np.ndarray)
+    np.testing.assert_array_equal(loaded.inner["tensor"], values)
+
+
+def test_load_torchscript_public_api(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "load_torchscript_api.pt"
+    values = np.array([11.0, 12.0], dtype=np.float32)
+    payload = {"x": _float_storage_payload(values)}
+    _write_synthetic_archive(
+        checkpoint,
+        payload,
+        {"0": values.tobytes()},
+        payload_name="constants.pkl",
+        root="",
+    )
+
+    loaded = load_torchscript(checkpoint)
+
+    np.testing.assert_array_equal(loaded["x"], values)
+
+
+def test_unknown_storage_callback_can_decode_custom_storage(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "unknown_storage_callback.pt"
+    values = np.array([1.5, 2.5], dtype=np.float32)
+    payload = {
+        "x": _TensorPayload(
+            _StorageRef("MysteryStorage", "0", values.size),
+            shape=(values.size,),
+        )
+    }
+    _write_synthetic_archive(checkpoint, payload, {"0": values.tobytes()})
+
+    with pytest.raises(CheckpointError, match="Unsupported storage dtype"):
+        load(checkpoint)
+
+    loaded = load(
+        checkpoint,
+        storage_type_resolver=lambda storage_type, _size: (
+            np.dtype(np.float32) if storage_type == "MysteryStorage" else None
+        ),
+    )
+
+    np.testing.assert_array_equal(loaded["x"], values)
+
+
+def test_unknown_pickle_global_callback_can_decode_custom_global(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "unknown_global_callback.pt"
+    values = np.array([3.0, 4.0], dtype=np.float32)
+    tensor_payload = _float_storage_payload(values)
+
+    class _CustomGlobalPayload:
+        def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
+            return (_custom_build_box, (tensor_payload,))
+
+    _write_synthetic_archive(checkpoint, _CustomGlobalPayload(), {"0": values.tobytes()})
+
+    with pytest.raises(CheckpointError, match="Unsupported pickle global"):
+        load(checkpoint)
+
+    def _resolve_custom_global(module: str, name: str) -> Any | None:
+        if module == _custom_build_box.__module__ and name == _custom_build_box.__name__:
+            return _custom_build_box
+        return None
+
+    loaded = load(checkpoint, pickle_global_resolver=_resolve_custom_global)
+
+    assert isinstance(loaded["wrapped"], np.ndarray)
+    np.testing.assert_array_equal(loaded["wrapped"], values)
